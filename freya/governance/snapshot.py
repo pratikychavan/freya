@@ -35,3 +35,8 @@ class WorkflowSnapshot(BaseModel):
     # Adaptive execution strategy
     current_strategy: str | None = None
     strategy_history: list[dict] = Field(default_factory=list)
+    # Execution economics
+    accumulated_cost: dict = Field(default_factory=dict)
+    strategy_cost_history: list[dict] = Field(default_factory=list)
+    budget: dict = Field(default_factory=dict)
+    workflow_priority: str = "normal"

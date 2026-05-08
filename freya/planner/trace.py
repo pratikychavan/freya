@@ -54,6 +54,10 @@ class PlannerEvent(BaseModel):
         "execution_strategy_escalated",
         "execution_strategy_blocked",
         "execution_strategy_terminated",
+        "execution_cost_recorded",
+        "workflow_budget_exceeded",
+        "strategy_blocked_by_budget",
+        "high_cost_workflow_detected",
     ]
     iteration: int
     payload: dict[str, Any] = Field(default_factory=dict)

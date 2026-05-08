@@ -65,6 +65,11 @@ class EventType:
     EXECUTION_STRATEGY_BLOCKED = "execution_strategy_blocked"
     EXECUTION_STRATEGY_TERMINATED = "execution_strategy_terminated"
 
+    EXECUTION_COST_RECORDED = "execution_cost_recorded"
+    WORKFLOW_BUDGET_EXCEEDED = "workflow_budget_exceeded"
+    STRATEGY_BLOCKED_BY_BUDGET = "strategy_blocked_by_budget"
+    HIGH_COST_WORKFLOW_DETECTED = "high_cost_workflow_detected"
+
 
 class RuntimeEvent(BaseModel):
     """A single runtime event emitted by the Freya event bus."""

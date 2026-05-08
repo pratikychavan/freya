@@ -39,6 +39,8 @@ from freya.workflows.capability_validation import validate_contract_capabilities
 from freya.strategies.engine import ExecutionStrategyEngine
 from freya.strategies.signals import RuntimeSignals
 from freya.strategies.models import ExecutionStrategy, StrategyDecision
+from freya.economics.engine import ExecutionEconomicsEngine
+from freya.economics.models import WorkflowBudget, WorkflowPriority
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,7 @@ class IterativePlannerRunner:
         event_bus: InProcessEventBus | None = None,
         coordinator: WorkflowCoordinator | None = None,
         strategy_engine: ExecutionStrategyEngine | None = None,
+        economics_engine: ExecutionEconomicsEngine | None = None,
     ) -> None:
         self._planner = planner
         self._dag_runner = dag_runner
@@ -96,6 +99,7 @@ class IterativePlannerRunner:
         self._event_bus: InProcessEventBus | None = event_bus
         self._coordinator: WorkflowCoordinator | None = coordinator
         self._strategy_engine: ExecutionStrategyEngine | None = strategy_engine
+        self._economics: ExecutionEconomicsEngine | None = economics_engine
 
     # ------------------------------------------------------------------
     # Event bus helper
@@ -666,6 +670,26 @@ class IterativePlannerRunner:
                     "iteration": iteration,
                     **strategy_decision.model_dump(mode="json"),
                 })
+
+                # Record economics cost for this strategy
+                if self._economics is not None:
+                    self._economics.record_strategy(strategy_decision.strategy)
+                    if not self._economics.within_budget():
+                        exceeded = self._economics.exceeded_fields()
+                        planner_trace.events.append(PlannerEvent(
+                            event_type="workflow_budget_exceeded",
+                            iteration=iteration,
+                            payload={
+                                "exceeded_fields": exceeded,
+                                "accumulated_cost": self._economics.current_cost().model_dump(),
+                            },
+                        ))
+                        await self._emit(
+                            EventType.WORKFLOW_BUDGET_EXCEEDED, session_id,
+                            iteration=iteration, workflow_state=WorkflowState.RUNNING,
+                            payload={"exceeded_fields": exceeded},
+                        )
+
                 planner_trace.events.append(PlannerEvent(
                     event_type="execution_strategy_selected",
                     iteration=iteration,
@@ -1010,6 +1034,22 @@ class IterativePlannerRunner:
                                 if strategy_history else None
                             ),
                             strategy_history=list(strategy_history),
+                            accumulated_cost=(
+                                self._economics.current_cost().model_dump()
+                                if self._economics is not None else {}
+                            ),
+                            strategy_cost_history=(
+                                self._economics.strategy_history()
+                                if self._economics is not None else []
+                            ),
+                            budget=(
+                                self._economics._budget.model_dump()
+                                if self._economics is not None else {}
+                            ),
+                            workflow_priority=(
+                                self._economics._priority.value
+                                if self._economics is not None else "normal"
+                            ),
                         )
                         # New snapshots always have expected_version=0 (initial write).
                         snapshot_path = self._persistent_store.save_snapshot(

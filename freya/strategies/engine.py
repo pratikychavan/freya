@@ -3,6 +3,12 @@ from __future__ import annotations
 from freya.strategies.models import ExecutionStrategy, StrategyDecision
 from freya.strategies.signals import RuntimeSignals
 
+# Imported lazily to avoid circular imports at module load time.
+# Type annotation only — evaluated at runtime inside methods.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from freya.economics.engine import ExecutionEconomicsEngine
+
 
 class ExecutionStrategyEngine:
     """Selects the next execution strategy from observable runtime signals.
@@ -28,11 +34,13 @@ class ExecutionStrategyEngine:
         max_validation_failures: int = 1,
         max_governance_blocks: int = 3,
         cognitive_confidence_threshold: float = 0.5,
+        economics_engine: "ExecutionEconomicsEngine | None" = None,
     ) -> None:
         self._max_recovery = max_recovery_attempts
         self._max_validation = max_validation_failures
         self._max_governance = max_governance_blocks
         self._cognitive_threshold = cognitive_confidence_threshold
+        self._economics: "ExecutionEconomicsEngine | None" = economics_engine
 
     def select_strategy(
         self,
@@ -41,6 +49,11 @@ class ExecutionStrategyEngine:
         runtime_signals: RuntimeSignals,
     ) -> StrategyDecision:
         """Evaluate signals and return the recommended StrategyDecision."""
+        decision = self._base_select(runtime_signals)
+        return self._apply_economic_constraints(decision, runtime_signals)
+
+    def _base_select(self, runtime_signals: RuntimeSignals) -> StrategyDecision:
+        """Pure signal-based strategy selection (no economics)."""
         triggered: list[str] = []
 
         # ── 1. Terminate if unrecoverable ──────────────────────────────────
@@ -143,3 +156,63 @@ class ExecutionStrategyEngine:
             confidence=1.0,
             triggered_by=[],
         )
+
+    def _apply_economic_constraints(
+        self, decision: StrategyDecision, runtime_signals: RuntimeSignals
+    ) -> StrategyDecision:
+        """Check economics engine and override the decision if budget is exhausted.
+
+        Evaluates the four economic policies in priority order:
+        1. HighCostApprovalPolicy  — total spend too high
+        2. CognitiveBudgetPolicy   — cognitive quota exhausted
+        3. DelegationCostPolicy    — delegation quota exhausted
+        4. RecoveryCostPolicy      — recovery loop exceeding budget
+        5. General budget exceeded — any budget field violated
+        """
+        if self._economics is None:
+            return decision
+
+        from freya.economics.policies import (
+            CognitiveBudgetPolicy,
+            DelegationCostPolicy,
+            HighCostApprovalPolicy,
+            RecoveryCostPolicy,
+        )
+        from freya.economics.models import WorkflowPriority
+
+        cost = self._economics.current_cost()
+        budget = self._economics._budget
+        priority = self._economics._priority
+
+        # Apply ordered economic policies
+        for policy in [
+            HighCostApprovalPolicy(),
+            CognitiveBudgetPolicy(),
+            DelegationCostPolicy(),
+            RecoveryCostPolicy(),
+        ]:
+            override = policy.evaluate(cost, budget, decision.strategy, priority)
+            if override is not None:
+                return StrategyDecision(
+                    strategy=override.strategy,
+                    reason=override.reason,
+                    confidence=override.confidence,
+                    triggered_by=list(decision.triggered_by) + override.triggered_by,
+                    governance_constraints=override.governance_constraints,
+                )
+
+        # General budget guard
+        if not self._economics.within_budget():
+            exceeded = self._economics.exceeded_fields()
+            return StrategyDecision(
+                strategy=ExecutionStrategy.TERMINATE,
+                reason=(
+                    f"Budget exceeded on field(s): {', '.join(exceeded)}. "
+                    "Terminating to protect resource limits."
+                ),
+                confidence=1.0,
+                triggered_by=list(decision.triggered_by) + ["general_budget_exceeded"],
+                governance_constraints=["halt_execution"],
+            )
+
+        return decision
