@@ -34,6 +34,11 @@ from freya.events.models import EventType, RuntimeEvent
 from freya.events.bus import InProcessEventBus
 from freya.workflows.coordinator import WorkflowCoordinator
 from freya.workflows.models import RelationshipType
+from freya.workflows.contracts import DelegationContract
+from freya.workflows.capability_validation import validate_contract_capabilities
+from freya.strategies.engine import ExecutionStrategyEngine
+from freya.strategies.signals import RuntimeSignals
+from freya.strategies.models import ExecutionStrategy, StrategyDecision
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,7 @@ class IterativePlannerRunner:
         runner_id: str | None = None,
         event_bus: InProcessEventBus | None = None,
         coordinator: WorkflowCoordinator | None = None,
+        strategy_engine: ExecutionStrategyEngine | None = None,
     ) -> None:
         self._planner = planner
         self._dag_runner = dag_runner
@@ -89,6 +95,7 @@ class IterativePlannerRunner:
         self.runner_id: str = runner_id or str(uuid.uuid4())
         self._event_bus: InProcessEventBus | None = event_bus
         self._coordinator: WorkflowCoordinator | None = coordinator
+        self._strategy_engine: ExecutionStrategyEngine | None = strategy_engine
 
     # ------------------------------------------------------------------
     # Event bus helper
@@ -126,11 +133,19 @@ class IterativePlannerRunner:
         session_id: str,
         goal: str,
     ) -> "list[Observation]":
-        """Execute subworkflow tasks inline, update context, and return new observations.
+        """Execute subworkflow tasks inline, validating delegation contracts first.
 
-        Each child workflow runs a full IterativePlannerRunner, inheriting governance,
-        event bus, persistence, and coordinator.  Child snapshots and leases are
-        independent from the parent.
+        Contract validation steps (per task):
+        1. Require a contract dict in ``task.input["contract"]``
+        2. Validate required capabilities against tool/prompt registries
+        3. Evaluate delegation governance policies (depth, budget, missing caps)
+
+        On validation failure the child is NOT spawned and a rejection
+        observation is added to the parent context.
+
+        Each accepted child workflow runs a full IterativePlannerRunner,
+        inheriting governance, event bus, persistence, and coordinator.
+        Child snapshots and leases are independent from the parent.
 
         Returns the list of summary Observations added to *context*.
         """
@@ -139,15 +154,229 @@ class IterativePlannerRunner:
         for task in sw_tasks:
             child_goal: str = task.input.get("goal", "")
             planning_mode_str: str = task.input.get("planning_mode", self._planning_mode.value)
+            contract_dict: dict | None = task.input.get("contract")
             child_session_id = str(uuid.uuid4())
 
-            # Register relationship
+            # -----------------------------------------------------------------
+            # Contract requirement check
+            # -----------------------------------------------------------------
+            if contract_dict is None:
+                rejection_summary = (
+                    f"delegation rejected: no contract provided for task {task.task_id}"
+                )
+                context.child_workflow_summaries.append(rejection_summary)
+                context.failed_tasks.append(task.task_id)
+                context.task_results[task.task_id] = {
+                    "status": "FAILED",
+                    "output": None,
+                    "error": "Subworkflow delegation requires an explicit DelegationContract.",
+                }
+                planner_trace.events.append(PlannerEvent(
+                    event_type="delegation_contract_rejected",
+                    iteration=iteration,
+                    payload={
+                        "task_id": task.task_id,
+                        "reason": "no_contract_provided",
+                    },
+                ))
+                await self._emit(
+                    EventType.DELEGATION_CONTRACT_REJECTED, session_id,
+                    iteration=iteration,
+                    workflow_state=WorkflowState.RUNNING,
+                    payload={"task_id": task.task_id, "reason": "no_contract_provided"},
+                )
+                obs = Observation(
+                    task_id=task.task_id,
+                    task_type="subworkflow",
+                    status="FAILED",
+                    semantic_summary=rejection_summary,
+                )
+                context.recent_observations.append(obs)
+                new_obs.append(obs)
+                continue
+
+            # -----------------------------------------------------------------
+            # Build DelegationContract
+            # -----------------------------------------------------------------
+            contract = DelegationContract(
+                parent_session_id=session_id,
+                child_session_id=child_session_id,
+                delegated_goal=child_goal,
+                delegation_reason=contract_dict.get("delegation_reason", ""),
+                required_capabilities=contract_dict.get("required_capabilities", []),
+                expected_outputs=contract_dict.get("expected_outputs", []),
+                success_criteria=contract_dict.get("success_criteria", []),
+                failure_handling=contract_dict.get("failure_handling", "observe_and_continue"),
+                max_iterations=contract_dict.get("max_iterations"),
+                max_runtime_seconds=contract_dict.get("max_runtime_seconds"),
+                governance_constraints=contract_dict.get("governance_constraints", []),
+            )
+
+            planner_trace.events.append(PlannerEvent(
+                event_type="delegation_contract_created",
+                iteration=iteration,
+                payload={
+                    "contract_id": contract.contract_id,
+                    "task_id": task.task_id,
+                    "delegated_goal": contract.delegated_goal,
+                    "required_capabilities": contract.required_capabilities,
+                },
+            ))
+            await self._emit(
+                EventType.DELEGATION_CONTRACT_CREATED, session_id,
+                iteration=iteration,
+                workflow_state=WorkflowState.RUNNING,
+                payload={
+                    "contract_id": contract.contract_id,
+                    "required_capabilities": contract.required_capabilities,
+                    "parent_session_id": session_id,
+                    "child_session_id": child_session_id,
+                },
+            )
+
+            # -----------------------------------------------------------------
+            # Capability validation
+            # -----------------------------------------------------------------
+            caps_valid, missing_caps = validate_contract_capabilities(
+                contract,
+                self._tool_registry,
+                self._prompt_capability_registry,
+            )
+            if not caps_valid:
+                rejection_summary = (
+                    f"delegation rejected: missing capability "
+                    + ", ".join(missing_caps)
+                    + f" for task {task.task_id}"
+                )
+                context.child_workflow_summaries.append(rejection_summary)
+                context.failed_tasks.append(task.task_id)
+                context.task_results[task.task_id] = {
+                    "status": "FAILED",
+                    "output": None,
+                    "error": rejection_summary,
+                }
+                planner_trace.events.append(PlannerEvent(
+                    event_type="delegation_capability_missing",
+                    iteration=iteration,
+                    payload={
+                        "contract_id": contract.contract_id,
+                        "task_id": task.task_id,
+                        "required_capabilities": contract.required_capabilities,
+                        "missing_capabilities": missing_caps,
+                    },
+                ))
+                await self._emit(
+                    EventType.DELEGATION_CAPABILITY_MISSING, session_id,
+                    iteration=iteration,
+                    workflow_state=WorkflowState.RUNNING,
+                    payload={
+                        "contract_id": contract.contract_id,
+                        "required_capabilities": contract.required_capabilities,
+                        "missing_capabilities": missing_caps,
+                    },
+                )
+                obs = Observation(
+                    task_id=task.task_id,
+                    task_type="subworkflow",
+                    status="FAILED",
+                    semantic_summary=rejection_summary,
+                )
+                context.recent_observations.append(obs)
+                new_obs.append(obs)
+                continue
+
+            # -----------------------------------------------------------------
+            # Delegation governance evaluation (depth + budget policies)
+            # -----------------------------------------------------------------
+            if self._governance is not None:
+                # Temporarily attach delegation context attributes so policies can
+                # inspect coordinator depth and pending contract without circular deps.
+                context._coordinator_ref = self._coordinator  # type: ignore[attr-defined]
+                context._pending_contract = contract  # type: ignore[attr-defined]
+                context._tool_registry_ref = self._tool_registry  # type: ignore[attr-defined]
+                context._prompt_registry_ref = self._prompt_capability_registry  # type: ignore[attr-defined]
+
+                from freya.dag.models import DAG as _DAG
+                gov_result = self._governance.evaluate(context, _DAG(tasks=[]))
+
+                # Clean up temp attributes
+                for _attr in ("_coordinator_ref", "_pending_contract",
+                               "_tool_registry_ref", "_prompt_registry_ref"):
+                    try:
+                        delattr(context, _attr)
+                    except AttributeError:
+                        pass
+
+                if gov_result.decision == InterventionDecision.REJECT:
+                    rejection_summary = (
+                        f"delegation rejected: {gov_result.reason} for task {task.task_id}"
+                    )
+                    context.child_workflow_summaries.append(rejection_summary)
+                    context.failed_tasks.append(task.task_id)
+                    context.task_results[task.task_id] = {
+                        "status": "FAILED",
+                        "output": None,
+                        "error": rejection_summary,
+                    }
+                    planner_trace.events.append(PlannerEvent(
+                        event_type="delegation_contract_rejected",
+                        iteration=iteration,
+                        payload={
+                            "contract_id": contract.contract_id,
+                            "task_id": task.task_id,
+                            "reason": gov_result.reason,
+                            "triggered_policies": gov_result.triggered_policies,
+                        },
+                    ))
+                    await self._emit(
+                        EventType.DELEGATION_CONTRACT_REJECTED, session_id,
+                        iteration=iteration,
+                        workflow_state=WorkflowState.RUNNING,
+                        payload={
+                            "contract_id": contract.contract_id,
+                            "reason": gov_result.reason,
+                            "triggered_policies": gov_result.triggered_policies,
+                        },
+                    )
+                    obs = Observation(
+                        task_id=task.task_id,
+                        task_type="subworkflow",
+                        status="FAILED",
+                        semantic_summary=rejection_summary,
+                    )
+                    context.recent_observations.append(obs)
+                    new_obs.append(obs)
+                    continue
+
+            # -----------------------------------------------------------------
+            # Contract validated — register and spawn
+            # -----------------------------------------------------------------
+            planner_trace.events.append(PlannerEvent(
+                event_type="delegation_contract_validated",
+                iteration=iteration,
+                payload={
+                    "contract_id": contract.contract_id,
+                    "task_id": task.task_id,
+                    "required_capabilities": contract.required_capabilities,
+                },
+            ))
+            await self._emit(
+                EventType.DELEGATION_CONTRACT_VALIDATED, session_id,
+                iteration=iteration,
+                workflow_state=WorkflowState.RUNNING,
+                payload={
+                    "contract_id": contract.contract_id,
+                    "required_capabilities": contract.required_capabilities,
+                },
+            )
+
             if self._coordinator is not None:
                 rel = self._coordinator.spawn_subworkflow(
                     parent_session_id=session_id,
                     child_session_id=child_session_id,
                     relationship_type=RelationshipType.SPAWNED_SUBWORKFLOW,
                 )
+                self._coordinator.register_contract(contract)
                 planner_trace.events.append(PlannerEvent(
                     event_type="workflow_relationship_created",
                     iteration=iteration,
@@ -156,6 +385,7 @@ class IterativePlannerRunner:
                         "child_session_id": child_session_id,
                         "relationship_type": rel.relationship_type,
                         "task_id": task.task_id,
+                        "contract_id": contract.contract_id,
                     },
                 ))
                 await self._emit(
@@ -165,6 +395,7 @@ class IterativePlannerRunner:
                         "parent_session_id": session_id,
                         "child_session_id": child_session_id,
                         "relationship_type": rel.relationship_type,
+                        "contract_id": contract.contract_id,
                     },
                 )
 
@@ -178,6 +409,7 @@ class IterativePlannerRunner:
                     "task_id": task.task_id,
                     "goal": child_goal,
                     "planning_mode": planning_mode_str,
+                    "contract_id": contract.contract_id,
                 },
             ))
             await self._emit(
@@ -189,14 +421,22 @@ class IterativePlannerRunner:
                     "child_session_id": child_session_id,
                     "relationship_type": RelationshipType.SPAWNED_SUBWORKFLOW,
                     "task_id": task.task_id,
+                    "contract_id": contract.contract_id,
                 },
             )
 
-            # Determine child planning mode (may differ from parent)
+            # Determine child planning mode
             try:
                 child_mode = PlanningMode(planning_mode_str)
             except ValueError:
                 child_mode = self._planning_mode
+
+            # Determine iteration cap from contract
+            child_max_iterations = (
+                contract.max_iterations
+                if contract.max_iterations is not None
+                else MAX_ITERATIONS
+            )
 
             # Spawn child runner — inherits governance, event bus, persistence store
             child_runner = IterativePlannerRunner(
@@ -213,18 +453,23 @@ class IterativePlannerRunner:
                 coordinator=self._coordinator,
             )
 
-            # Execute child workflow
+            # Execute child workflow under contract budget
             child_result = await child_runner.run(
-                child_goal, session_id=child_session_id
+                child_goal,
+                session_id=child_session_id,
+                max_iterations=child_max_iterations,
             )
 
+            # -----------------------------------------------------------------
             # Build summary observation
+            # -----------------------------------------------------------------
             if child_result.workflow_state == WorkflowState.COMPLETED:
-                summary = f"subworkflow {task.task_id} completed successfully"
+                summary = f"subworkflow {task.task_id} succeeded under contract"
                 context.task_results[task.task_id] = {
                     "status": "SUCCESS",
                     "output": {
                         "child_session_id": child_session_id,
+                        "contract_id": contract.contract_id,
                         "completed_tasks": list(child_result.final_context.completed_tasks),
                     },
                     "error": None,
@@ -237,6 +482,7 @@ class IterativePlannerRunner:
                         "parent_session_id": session_id,
                         "child_session_id": child_session_id,
                         "task_id": task.task_id,
+                        "contract_id": contract.contract_id,
                         "completed_tasks": list(child_result.final_context.completed_tasks),
                     },
                 ))
@@ -248,8 +494,32 @@ class IterativePlannerRunner:
                         "parent_session_id": session_id,
                         "child_session_id": child_session_id,
                         "relationship_type": RelationshipType.SPAWNED_SUBWORKFLOW,
+                        "contract_id": contract.contract_id,
                     },
                 )
+            elif child_result.workflow_state == WorkflowState.PAUSED_FOR_APPROVAL:
+                summary = f"subworkflow {task.task_id} paused for approval (governed independently)"
+                context.task_results[task.task_id] = {
+                    "status": "PAUSED",
+                    "output": {
+                        "child_session_id": child_session_id,
+                        "contract_id": contract.contract_id,
+                        "approval_request_id": child_result.approval_request_id,
+                    },
+                    "error": None,
+                }
+                context.completed_tasks.append(task.task_id)
+                planner_trace.events.append(PlannerEvent(
+                    event_type="subworkflow_completed",
+                    iteration=iteration,
+                    payload={
+                        "parent_session_id": session_id,
+                        "child_session_id": child_session_id,
+                        "task_id": task.task_id,
+                        "contract_id": contract.contract_id,
+                        "child_state": "paused_for_approval",
+                    },
+                ))
             else:
                 failure_state = child_result.workflow_state.value
                 summary = f"subworkflow {task.task_id} failed due to {failure_state}"
@@ -266,6 +536,7 @@ class IterativePlannerRunner:
                         "parent_session_id": session_id,
                         "child_session_id": child_session_id,
                         "task_id": task.task_id,
+                        "contract_id": contract.contract_id,
                         "child_state": failure_state,
                     },
                 ))
@@ -277,17 +548,18 @@ class IterativePlannerRunner:
                         "parent_session_id": session_id,
                         "child_session_id": child_session_id,
                         "relationship_type": RelationshipType.SPAWNED_SUBWORKFLOW,
+                        "contract_id": contract.contract_id,
                         "child_state": failure_state,
                     },
                 )
 
-            # Record summary in context
             context.child_workflow_summaries.append(summary)
 
-            # Inject summarized observation (no raw child traces)
             child_status = (
                 "SUCCESS"
-                if child_result.workflow_state == WorkflowState.COMPLETED
+                if child_result.workflow_state in (
+                    WorkflowState.COMPLETED, WorkflowState.PAUSED_FOR_APPROVAL
+                )
                 else "FAILED"
             )
             obs = Observation(
@@ -309,6 +581,8 @@ class IterativePlannerRunner:
     ) -> PlannerResult:
         session_id = session_id or str(uuid.uuid4())
         recovery_counts: dict[str, int] = {}  # per-task runtime recovery count
+        runtime_signals = RuntimeSignals()
+        strategy_history: list[dict] = []
 
         # Export tool capabilities once for the entire run.
         capabilities = self._tool_registry.export_capabilities()
@@ -380,6 +654,60 @@ class IterativePlannerRunner:
             }
 
             logger.info("Planner iteration %d  goal=%r", iteration, goal)
+
+            # -----------------------------------------------------------------
+            # Strategy selection
+            # -----------------------------------------------------------------
+            if self._strategy_engine is not None:
+                strategy_decision = self._strategy_engine.select_strategy(
+                    context, None, runtime_signals
+                )
+                strategy_history.append({
+                    "iteration": iteration,
+                    **strategy_decision.model_dump(mode="json"),
+                })
+                planner_trace.events.append(PlannerEvent(
+                    event_type="execution_strategy_selected",
+                    iteration=iteration,
+                    payload={
+                        "strategy": strategy_decision.strategy.value,
+                        "reason": strategy_decision.reason,
+                        "confidence": strategy_decision.confidence,
+                        "triggered_by": strategy_decision.triggered_by,
+                    },
+                ))
+                await self._emit(
+                    EventType.EXECUTION_STRATEGY_SELECTED, session_id,
+                    iteration=iteration, workflow_state=WorkflowState.RUNNING,
+                    payload={
+                        "strategy": strategy_decision.strategy.value,
+                        "reason": strategy_decision.reason,
+                        "triggered_by": strategy_decision.triggered_by,
+                    },
+                )
+
+                # Act on terminate decision immediately
+                if strategy_decision.strategy == ExecutionStrategy.TERMINATE:
+                    planner_trace.events.append(PlannerEvent(
+                        event_type="execution_strategy_terminated",
+                        iteration=iteration,
+                        payload={
+                            "reason": strategy_decision.reason,
+                            "triggered_by": strategy_decision.triggered_by,
+                        },
+                    ))
+                    await self._emit(
+                        EventType.EXECUTION_STRATEGY_TERMINATED, session_id,
+                        iteration=iteration, workflow_state=WorkflowState.RUNNING,
+                        payload={"reason": strategy_decision.reason},
+                    )
+                    planner_trace.status = "FAILED"
+                    planner_trace.termination_reason = "strategy_terminated"
+                    planner_trace.end_time = time.time()
+                    planner_trace.iterations_completed = iteration
+                    return PlannerResult(session_id, goal, context, planner_trace,
+                                         workflow_state=WorkflowState.FAILED)
+
             await self._emit(EventType.PLANNER_ITERATION_STARTED, session_id,
                              iteration=iteration, workflow_state=WorkflowState.RUNNING,
                              payload={"goal": goal})
@@ -434,6 +762,10 @@ class IterativePlannerRunner:
                 else:
                     issues_text = vr.as_text()
                     logger.warning("DAG validation failed: %s", issues_text)
+                    runtime_signals = RuntimeSignals(
+                        **{**runtime_signals.model_dump(),
+                           "validation_failures": runtime_signals.validation_failures + 1}
+                    )
                     planner_trace.events.append(PlannerEvent(
                         event_type="planner_validation_failed",
                         iteration=iteration,
@@ -579,6 +911,10 @@ class IterativePlannerRunner:
 
                 if gov_decision.decision == InterventionDecision.REJECT:
                     # Hard reject — terminate immediately.
+                    runtime_signals = RuntimeSignals(
+                        **{**runtime_signals.model_dump(),
+                           "governance_blocks": runtime_signals.governance_blocks + 1}
+                    )
                     _add_governance_obs(
                         context,
                         dag.tasks[0].task_id if dag.tasks else "unknown",
@@ -605,6 +941,10 @@ class IterativePlannerRunner:
 
                 if gov_decision.decision == InterventionDecision.REQUIRE_APPROVAL:
                     # Pause — create an approval request and stop execution.
+                    runtime_signals = RuntimeSignals(
+                        **{**runtime_signals.model_dump(),
+                           "pending_approvals": runtime_signals.pending_approvals + 1}
+                    )
                     obs_summaries = [
                         o.as_summary() for o in context.recent_observations
                         if o.semantic_summary
@@ -637,6 +977,14 @@ class IterativePlannerRunner:
                     ))
                     # Persist snapshot + approval to durable store if configured.
                     if self._persistent_store is not None:
+                        # Collect active delegation contracts from coordinator
+                        _active_contracts: list[dict] = []
+                        if self._coordinator is not None:
+                            for _c in self._coordinator.all_contracts():
+                                try:
+                                    _active_contracts.append(_c.model_dump(mode="json"))  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
                         snapshot = WorkflowSnapshot(
                             session_id=session_id,
                             workflow_state=WorkflowState.PAUSED_FOR_APPROVAL,
@@ -656,6 +1004,12 @@ class IterativePlannerRunner:
                             paused_dag_fragment=dag.model_dump(),
                             approval_request_id=approval_req.request_id,
                             lease_owner=self.runner_id,
+                            active_contracts=_active_contracts,
+                            current_strategy=(
+                                strategy_history[-1]["strategy"]
+                                if strategy_history else None
+                            ),
+                            strategy_history=list(strategy_history),
                         )
                         # New snapshots always have expected_version=0 (initial write).
                         snapshot_path = self._persistent_store.save_snapshot(
@@ -845,6 +1199,10 @@ class IterativePlannerRunner:
             # Runtime failure recovery
             # -----------------------------------------------------------------
             if dag_result.status == "FAILED":
+                runtime_signals = RuntimeSignals(
+                    **{**runtime_signals.model_dump(),
+                       "runtime_failures": runtime_signals.runtime_failures + 1}
+                )
                 recovery_outcome = await self._handle_runtime_failures(
                     dag=dag_for_runner,
                     dag_result=dag_result,
@@ -855,6 +1213,11 @@ class IterativePlannerRunner:
                     session_id=session_id,
                     goal=goal,
                 )
+                if recovery_outcome == "recover":
+                    runtime_signals = RuntimeSignals(
+                        **{**runtime_signals.model_dump(),
+                           "recovery_attempts": runtime_signals.recovery_attempts + 1}
+                    )
                 if recovery_outcome == "terminate":
                     return PlannerResult(session_id, goal, context, planner_trace,
                                          workflow_state=WorkflowState.FAILED)

@@ -30,3 +30,8 @@ class WorkflowSnapshot(BaseModel):
     version: int = 0
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
+    # Delegation contract lineage — serialized DelegationContract dicts
+    active_contracts: list[dict] = Field(default_factory=list)
+    # Adaptive execution strategy
+    current_strategy: str | None = None
+    strategy_history: list[dict] = Field(default_factory=list)

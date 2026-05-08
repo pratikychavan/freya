@@ -4,7 +4,7 @@ from freya.workflows.models import RelationshipType, WorkflowRelationship
 
 
 class WorkflowCoordinator:
-    """In-memory registry of workflow parent-child relationships.
+    """In-memory registry of workflow parent-child relationships and delegation contracts.
 
     Deterministic, local, and inspectable.  All coordination is explicit —
     no peer-to-peer communication, no networking, no distributed execution.
@@ -12,6 +12,8 @@ class WorkflowCoordinator:
 
     def __init__(self) -> None:
         self._relationships: list[WorkflowRelationship] = []
+        # child_session_id → DelegationContract (stored as dict to avoid circular imports)
+        self._contracts: dict[str, object] = {}
 
     # ------------------------------------------------------------------
     # Registration
@@ -20,6 +22,12 @@ class WorkflowCoordinator:
     def register(self, relationship: WorkflowRelationship) -> None:
         """Record a new parent → child relationship."""
         self._relationships.append(relationship)
+
+    def register_contract(self, contract: object) -> None:
+        """Store a DelegationContract keyed by child_session_id."""
+        child_id = getattr(contract, "child_session_id", None)
+        if child_id:
+            self._contracts[child_id] = contract
 
     def spawn_subworkflow(
         self,
@@ -55,19 +63,16 @@ class WorkflowCoordinator:
                 return r.parent_session_id
         return None
 
+    def get_contract(self, child_session_id: str) -> object | None:
+        """Return the DelegationContract for a given child session, or None."""
+        return self._contracts.get(child_session_id)
+
+    def all_contracts(self) -> list[object]:
+        """Return all registered delegation contracts."""
+        return list(self._contracts.values())
+
     def workflow_tree(self, session_id: str) -> dict:
-        """Return a nested dict representing the workflow subtree rooted at *session_id*.
-
-        Format::
-
-            {
-                "session_id": "...",
-                "children": [
-                    {"session_id": "...", "children": [...]},
-                    ...
-                ]
-            }
-        """
+        """Return a nested dict representing the workflow subtree rooted at *session_id*."""
         return {
             "session_id": session_id,
             "children": [

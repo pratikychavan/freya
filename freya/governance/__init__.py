@@ -16,6 +16,11 @@ from freya.governance.policies import (
     DangerousToolPolicy,
     ExcessiveRecoveryPolicy,
 )
+from freya.governance.delegation_policies import (
+    ExcessiveDelegationDepthPolicy,
+    MissingCapabilityPolicy,
+    DelegationBudgetPolicy,
+)
 
 __all__ = [
     "InterventionDecision",
@@ -33,4 +38,7 @@ __all__ = [
     "CognitiveModeApprovalPolicy",
     "DangerousToolPolicy",
     "ExcessiveRecoveryPolicy",
+    "ExcessiveDelegationDepthPolicy",
+    "MissingCapabilityPolicy",
+    "DelegationBudgetPolicy",
 ]

@@ -37,6 +37,10 @@ Scenarios:
   X. CHILD FAILURE OBSERVATION — child fails; parent observes summarized failure
   Y. WORKFLOW TREE        — render workflow hierarchy
   Z. GOVERNANCE INHERITED — child pauses for approval independently
+  AA. VALID DELEGATION CONTRACT — child spawned; capabilities validated; contract rendered
+  AB. MISSING CAPABILITY REJECTION — delegation blocked; parent observes rejection
+  AC. DELEGATION BUDGET EXCEEDED — excessive child spawning blocked by DelegationBudgetPolicy
+  AD. CONTRACT PERSISTENCE — contract survives pause/resume workflow
 """
 from __future__ import annotations
 
@@ -88,6 +92,11 @@ from freya import (
     WorkflowRelationship,
     RelationshipType,
     render_workflow_tree,
+    DelegationContract,
+    validate_contract_capabilities,
+    ExcessiveDelegationDepthPolicy,
+    MissingCapabilityPolicy,
+    DelegationBudgetPolicy,
 )
 
 
@@ -507,7 +516,18 @@ def _make_subworkflow_w_planner_llm() -> AsyncMock:
                 "tasks": [{
                     "task_id": "analyze_logs",
                     "type": "subworkflow",
-                    "input": {"goal": "Analyze log data and store result", "planning_mode": "deterministic"},
+                    "input": {
+                        "goal": "Analyze log data and store result",
+                        "planning_mode": "deterministic",
+                        "contract": {
+                            "delegation_reason": "Delegate log analysis to specialized subworkflow",
+                            "required_capabilities": ["write_value"],
+                            "expected_outputs": ["log_result"],
+                            "success_criteria": ["log_result stored in memory"],
+                            "failure_handling": "observe_and_continue",
+                            "max_iterations": 3,
+                        },
+                    },
                 }]
             }),
             "usage": {},
@@ -542,7 +562,16 @@ def _make_subworkflow_x_planner_llm() -> AsyncMock:
                 "tasks": [{
                     "task_id": "classify_incident",
                     "type": "subworkflow",
-                    "input": {"goal": "Classify security incident"},
+                    "input": {
+                        "goal": "Classify security incident",
+                        "contract": {
+                            "delegation_reason": "Delegate classification to sub-analyzer",
+                            "required_capabilities": ["fatal_operation"],
+                            "expected_outputs": ["incident_class"],
+                            "success_criteria": ["classification stored"],
+                            "failure_handling": "observe_and_continue",
+                        },
+                    },
                 }]
             }),
             "usage": {},
@@ -592,6 +621,217 @@ def _build_dangerous_tool_governance() -> GovernanceEngine:
     ge = GovernanceEngine()
     ge.register(DangerousToolPolicy(dangerous_tools=frozenset({"delete_data", "write_value"})))
     return ge
+
+
+def _make_contract_valid_planner_llm() -> AsyncMock:
+    """Scenario AA: parent spawns child with valid contract; child completes.
+
+    Call 0 (parent): subworkflow task with full contract
+    Call 1 (child):  write_value tool task
+    Call 2 (child):  empty DAG (done)
+    Call 3 (parent): empty DAG (done)
+    """
+    llm = AsyncMock()
+    llm.complete.side_effect = [
+        {
+            "text": json.dumps({
+                "tasks": [{
+                    "task_id": "process_data",
+                    "type": "subworkflow",
+                    "input": {
+                        "goal": "Store processed data result",
+                        "planning_mode": "deterministic",
+                        "contract": {
+                            "delegation_reason": "Delegate data processing to specialized child",
+                            "required_capabilities": ["write_value", "read_value"],
+                            "expected_outputs": ["data_result"],
+                            "success_criteria": ["data_result key stored in memory"],
+                            "failure_handling": "observe_and_continue",
+                            "max_iterations": 3,
+                            "governance_constraints": [],
+                        },
+                    },
+                }]
+            }),
+            "usage": {},
+        },
+        {
+            "text": json.dumps({
+                "tasks": [{
+                    "task_id": "store_data",
+                    "type": "tool",
+                    "input": {"tool_name": "write_value", "tool_input": {"key": "data_result", "value": "processed_ok"}},
+                }]
+            }),
+            "usage": {},
+        },
+        {"text": json.dumps({"tasks": []}), "usage": {}},
+        {"text": json.dumps({"tasks": []}), "usage": {}},
+    ]
+    return llm
+
+
+def _make_missing_capability_planner_llm() -> AsyncMock:
+    """Scenario AB: contract requires 'classify_logs' which doesn't exist → rejection.
+
+    Call 0 (parent): subworkflow with missing capability
+    Call 1 (parent): empty DAG (adapts after observing rejection)
+    """
+    llm = AsyncMock()
+    llm.complete.side_effect = [
+        {
+            "text": json.dumps({
+                "tasks": [{
+                    "task_id": "classify_logs",
+                    "type": "subworkflow",
+                    "input": {
+                        "goal": "Classify log entries",
+                        "contract": {
+                            "delegation_reason": "Need specialized classify_logs tool",
+                            "required_capabilities": ["classify_logs", "write_value"],
+                            "expected_outputs": ["log_classification"],
+                            "success_criteria": ["log_classification stored"],
+                            "failure_handling": "observe_and_continue",
+                        },
+                    },
+                }]
+            }),
+            "usage": {},
+        },
+        {"text": json.dumps({"tasks": []}), "usage": {}},
+    ]
+    return llm
+
+
+def _make_budget_exceeded_planner_llm() -> AsyncMock:
+    """Scenario AC: three subworkflow tasks; budget allows only 2; third rejected.
+
+    Parent has DelegationBudgetPolicy(max_children=2).
+    Calls 0,1,2: parent planning (3 subworkflow tasks in iteration 0)
+    Calls 3-8: child 1 and child 2 child planning (each: tool then empty)
+    """
+    llm = AsyncMock()
+
+    def make_sw_task(task_id: str) -> dict:
+        return {
+            "task_id": task_id,
+            "type": "subworkflow",
+            "input": {
+                "goal": f"Run subtask {task_id}",
+                "planning_mode": "deterministic",
+                "contract": {
+                    "delegation_reason": f"Delegate {task_id}",
+                    "required_capabilities": ["write_value"],
+                    "expected_outputs": [task_id + "_result"],
+                    "success_criteria": ["result stored"],
+                    "failure_handling": "observe_and_continue",
+                },
+            },
+        }
+
+    llm.complete.side_effect = [
+        # parent iter=0: 3 subworkflow tasks
+        {
+            "text": json.dumps({"tasks": [
+                make_sw_task("child_a"),
+                make_sw_task("child_b"),
+                make_sw_task("child_c"),
+            ]}),
+            "usage": {},
+        },
+        # child_a iter=0: do work
+        {
+            "text": json.dumps({"tasks": [{
+                "task_id": "store_a",
+                "type": "tool",
+                "input": {"tool_name": "write_value", "tool_input": {"key": "child_a_result", "value": "done"}},
+            }]}),
+            "usage": {},
+        },
+        # child_a iter=1: done
+        {"text": json.dumps({"tasks": []}), "usage": {}},
+        # child_b iter=0: do work
+        {
+            "text": json.dumps({"tasks": [{
+                "task_id": "store_b",
+                "type": "tool",
+                "input": {"tool_name": "write_value", "tool_input": {"key": "child_b_result", "value": "done"}},
+            }]}),
+            "usage": {},
+        },
+        # child_b iter=1: done
+        {"text": json.dumps({"tasks": []}), "usage": {}},
+        # parent iter=1: done (after adapting to child_c rejection)
+        {"text": json.dumps({"tasks": []}), "usage": {}},
+    ]
+    return llm
+
+
+def _make_contract_persist_planner_llm() -> AsyncMock:
+    """Scenario AD: parent spawns child (contract persisted), then pauses for approval.
+
+    The child uses write_value which is in the dangerous tools list.
+    Governance fires on the child → child pauses.
+    Parent treats child as delegated (paused independently) → continues.
+    Parent iter=1 → also uses write_value → parent pauses for approval.
+    After approval the parent completes.
+
+    LLM calls:
+      0: parent iter=0 → subworkflow task
+      1: child iter=0 → write_value task (child governance fires → child pauses)
+      2: parent iter=1 → write_value task (parent governance fires → parent pauses)
+      3: parent after approval resume → empty DAG (done)
+    """
+    llm = AsyncMock()
+    llm.complete.side_effect = [
+        # 0: parent iter=0 → subworkflow task
+        {
+            "text": json.dumps({
+                "tasks": [{
+                    "task_id": "prepare_data",
+                    "type": "subworkflow",
+                    "input": {
+                        "goal": "Prepare data for analysis",
+                        "planning_mode": "deterministic",
+                        "contract": {
+                            "delegation_reason": "Pre-process data before main analysis",
+                            "required_capabilities": ["write_value"],
+                            "expected_outputs": ["prepared_data"],
+                            "success_criteria": ["prepared_data stored"],
+                            "failure_handling": "observe_and_continue",
+                            "max_iterations": 2,
+                        },
+                    },
+                }]
+            }),
+            "usage": {},
+        },
+        # 1: child iter=0 → triggers DangerousToolPolicy → child pauses
+        {
+            "text": json.dumps({
+                "tasks": [{
+                    "task_id": "write_prepared",
+                    "type": "tool",
+                    "input": {"tool_name": "write_value", "tool_input": {"key": "prepared_data", "value": "ready"}},
+                }]
+            }),
+            "usage": {},
+        },
+        # 2: parent iter=1 → write_value (dangerous) → parent pauses
+        {
+            "text": json.dumps({
+                "tasks": [{
+                    "task_id": "finalize_data",
+                    "type": "tool",
+                    "input": {"tool_name": "write_value", "tool_input": {"key": "status", "value": "done"}},
+                }]
+            }),
+            "usage": {},
+        },
+        # 3: parent after approval resume → done
+        {"text": json.dumps({"tasks": []}), "usage": {}},
+    ]
+    return llm
 
 
 # ---------------------------------------------------------------------------
@@ -1613,6 +1853,230 @@ async def main() -> None:
 
     print(f"\n  Workflow tree (z-parent → z-child):")
     for line in render_workflow_tree(coordinator_z, z_parent_session).splitlines():
+        print(f"    {line}")
+
+    # =========================================================================
+    # Capability-Aware Delegation + Planning Contract Scenarios (AA / AB / AC / AD)
+    # =========================================================================
+
+    # -------------------------------------------------------------------------
+    # Scenario AA: VALID DELEGATION CONTRACT
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("  Scenario AA: VALID DELEGATION CONTRACT")
+    print("  (child spawned; capabilities validated; contract rendered)")
+    print("=" * 60)
+
+    coordinator_aa = WorkflowCoordinator()
+
+    runner_aa = IterativePlannerRunner(
+        planner=SimpleIterativePlanner(
+            llm_adapter=_make_contract_valid_planner_llm(),
+            prompt_registry=prompt_registry,
+        ),
+        dag_runner=dag_runner,
+        tool_registry=tool_registry,
+        memory=InMemoryStore(),
+        planning_mode=PlanningMode.DETERMINISTIC,
+        coordinator=coordinator_aa,
+    )
+
+    result_aa = await runner_aa.run(
+        goal="Process and store data result.",
+        session_id="aa-parent",
+    )
+
+    print(f"\n  Parent workflow state: {result_aa.workflow_state.value}")
+    print(f"  Completed tasks     : {result_aa.final_context.completed_tasks}")
+    print(f"  Child summaries     : {result_aa.final_context.child_workflow_summaries}")
+
+    contract_events_aa = [
+        ev for ev in result_aa.trace.events
+        if "delegation_contract" in ev.event_type or "subworkflow" in ev.event_type
+    ]
+    print(f"\n  Delegation/contract events ({len(contract_events_aa)}):")
+    for ev in contract_events_aa:
+        print(f"    iter={ev.iteration}  {ev.event_type}")
+
+    # Contract details
+    children_aa = coordinator_aa.get_children("aa-parent")
+    print(f"\n  Children: {len(children_aa)}")
+    for child_id in children_aa:
+        c = coordinator_aa.get_contract(child_id)
+        if c:
+            print(f"    contract_id       : {c.contract_id[:8]}...")
+            print(f"    delegation_reason : {c.delegation_reason}")
+            print(f"    required_caps     : {c.required_capabilities}")
+            print(f"    success_criteria  : {c.success_criteria}")
+
+    # Validate contract capabilites manually (helper)
+    if children_aa:
+        child_contract = coordinator_aa.get_contract(children_aa[0])
+        if child_contract:
+            valid, missing = validate_contract_capabilities(
+                child_contract, tool_registry
+            )
+            print(f"\n  validate_contract_capabilities: valid={valid}, missing={missing}")
+
+    # Render tree with contract details
+    print(f"\n  Workflow tree with contracts:")
+    for line in render_workflow_tree(coordinator_aa, "aa-parent", show_contracts=True).splitlines():
+        print(f"    {line}")
+
+    # -------------------------------------------------------------------------
+    # Scenario AB: MISSING CAPABILITY REJECTION
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("  Scenario AB: MISSING CAPABILITY REJECTION")
+    print("  (delegation blocked due to missing 'classify_logs' capability)")
+    print("=" * 60)
+
+    coordinator_ab = WorkflowCoordinator()
+
+    runner_ab = IterativePlannerRunner(
+        planner=SimpleIterativePlanner(
+            llm_adapter=_make_missing_capability_planner_llm(),
+            prompt_registry=prompt_registry,
+        ),
+        dag_runner=dag_runner,
+        tool_registry=tool_registry,
+        memory=InMemoryStore(),
+        planning_mode=PlanningMode.DETERMINISTIC,
+        coordinator=coordinator_ab,
+    )
+
+    result_ab = await runner_ab.run(
+        goal="Classify and analyze log entries.",
+        session_id="ab-parent",
+    )
+
+    print(f"\n  Parent workflow state: {result_ab.workflow_state.value}")
+    print(f"  Child summaries     : {result_ab.final_context.child_workflow_summaries}")
+    print(f"  Children spawned    : {len(coordinator_ab.get_children('ab-parent'))}")
+
+    rejection_events_ab = [
+        ev for ev in result_ab.trace.events
+        if "delegation_capability_missing" in ev.event_type
+        or "delegation_contract_rejected" in ev.event_type
+    ]
+    print(f"\n  Rejection events ({len(rejection_events_ab)}):")
+    for ev in rejection_events_ab:
+        print(f"    {ev.event_type}")
+        for k, v in ev.payload.items():
+            print(f"      {k}: {v}")
+
+    print(f"\n  Parent observations (summarized, no raw traces):")
+    for obs in result_ab.final_context.recent_observations:
+        print(f"    [{obs.status}] {obs.task_id}: {obs.semantic_summary}")
+
+    # -------------------------------------------------------------------------
+    # Scenario AC: DELEGATION BUDGET EXCEEDED
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("  Scenario AC: DELEGATION BUDGET EXCEEDED")
+    print("  (DelegationBudgetPolicy(max_children=2) blocks 3rd child)")
+    print("=" * 60)
+
+    coordinator_ac = WorkflowCoordinator()
+    delegation_governance_ac = GovernanceEngine()
+    delegation_governance_ac.register(DelegationBudgetPolicy(max_children=2))
+
+    runner_ac = IterativePlannerRunner(
+        planner=SimpleIterativePlanner(
+            llm_adapter=_make_budget_exceeded_planner_llm(),
+            prompt_registry=prompt_registry,
+        ),
+        dag_runner=dag_runner,
+        tool_registry=tool_registry,
+        memory=InMemoryStore(),
+        planning_mode=PlanningMode.DETERMINISTIC,
+        governance_engine=delegation_governance_ac,
+        coordinator=coordinator_ac,
+    )
+
+    result_ac = await runner_ac.run(
+        goal="Run three subtasks in delegation.",
+        session_id="ac-parent",
+    )
+
+    print(f"\n  Parent workflow state: {result_ac.workflow_state.value}")
+    print(f"  Children spawned    : {len(coordinator_ac.get_children('ac-parent'))}")
+    print(f"  Child summaries     : {result_ac.final_context.child_workflow_summaries}")
+
+    budget_events_ac = [
+        ev for ev in result_ac.trace.events
+        if "delegation_contract_rejected" in ev.event_type
+    ]
+    print(f"\n  Budget-rejected delegation events ({len(budget_events_ac)}):")
+    for ev in budget_events_ac:
+        print(f"    {ev.event_type}: {ev.payload.get('reason', '')}")
+
+    print(f"\n  Workflow tree:")
+    for line in render_workflow_tree(coordinator_ac, "ac-parent").splitlines():
+        print(f"    {line}")
+
+    # -------------------------------------------------------------------------
+    # Scenario AD: CONTRACT PERSISTENCE
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("  Scenario AD: CONTRACT PERSISTENCE")
+    print("  (contract survives pause/resume; snapshot includes active_contracts)")
+    print("=" * 60)
+
+    import tempfile as _tempfile
+    persist_base_ad = Path(_tempfile.mkdtemp()) / "freya_state_ad"
+    persistent_store_ad = PersistentWorkflowStore(base_dir=persist_base_ad)
+    approval_store_ad = InMemoryApprovalStore()
+    coordinator_ad = WorkflowCoordinator()
+    governance_ad = GovernanceEngine()
+    governance_ad.register(DangerousToolPolicy(dangerous_tools=frozenset({"delete_data", "write_value"})))
+
+    runner_ad = IterativePlannerRunner(
+        planner=SimpleIterativePlanner(
+            llm_adapter=_make_contract_persist_planner_llm(),
+            prompt_registry=prompt_registry,
+        ),
+        dag_runner=dag_runner,
+        tool_registry=tool_registry,
+        memory=InMemoryStore(),
+        planning_mode=PlanningMode.DETERMINISTIC,
+        governance_engine=governance_ad,
+        approval_store=approval_store_ad,
+        persistent_store=persistent_store_ad,
+        coordinator=coordinator_ad,
+        runner_id="runner-ad",
+    )
+
+    paused_ad = await runner_ad.run(
+        goal="Prepare and then finalize data.",
+        session_id="ad-session",
+    )
+    print(f"\n  Workflow state after first run: {paused_ad.workflow_state.value}")
+    print(f"  Child summaries              : {paused_ad.final_context.child_workflow_summaries}")
+
+    snap_ad = persistent_store_ad.load_snapshot("ad-session")
+    if snap_ad is not None:
+        print(f"\n  Snapshot on disk:")
+        print(f"    version          : {snap_ad.version}")
+        print(f"    active_contracts : {len(snap_ad.active_contracts)}")
+        for c_dict in snap_ad.active_contracts:
+            print(f"      contract_id   : {c_dict.get('contract_id', 'unknown')[:8]}...")
+            print(f"      delegated_goal: {c_dict.get('delegated_goal', '')}")
+            print(f"      required_caps : {c_dict.get('required_capabilities', [])}")
+
+    if (
+        paused_ad.workflow_state == WorkflowState.PAUSED_FOR_APPROVAL
+        and paused_ad.approval_request_id
+    ):
+        approval_store_ad.approve(paused_ad.approval_request_id)
+        resumed_ad = await runner_ad.resume_from_approval(paused_ad.approval_request_id)
+        print(f"\n  Resumed workflow state: {resumed_ad.workflow_state.value}")
+        print(f"  Completed tasks       : {resumed_ad.final_context.completed_tasks}")
+    else:
+        print("\n  (workflow did not pause — scenario AD check failed)")
+
+    print(f"\n  Workflow tree with contracts:")
+    for line in render_workflow_tree(coordinator_ad, "ad-session", show_contracts=True).splitlines():
         print(f"    {line}")
 
     print()

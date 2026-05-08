@@ -52,7 +52,18 @@ class EventType:
     SUBWORKFLOW_FAILED = "subworkflow_failed"
     WORKFLOW_RELATIONSHIP_CREATED = "workflow_relationship_created"
 
+    DELEGATION_CONTRACT_CREATED = "delegation_contract_created"
+    DELEGATION_CONTRACT_VALIDATED = "delegation_contract_validated"
+    DELEGATION_CONTRACT_REJECTED = "delegation_contract_rejected"
+    DELEGATION_BUDGET_EXCEEDED = "delegation_budget_exceeded"
+    DELEGATION_CAPABILITY_MISSING = "delegation_capability_missing"
+
     SUBSCRIBER_FAILURE = "subscriber_failure"
+
+    EXECUTION_STRATEGY_SELECTED = "execution_strategy_selected"
+    EXECUTION_STRATEGY_ESCALATED = "execution_strategy_escalated"
+    EXECUTION_STRATEGY_BLOCKED = "execution_strategy_blocked"
+    EXECUTION_STRATEGY_TERMINATED = "execution_strategy_terminated"
 
 
 class RuntimeEvent(BaseModel):

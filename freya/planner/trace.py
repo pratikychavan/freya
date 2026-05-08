@@ -45,6 +45,15 @@ class PlannerEvent(BaseModel):
         "subworkflow_completed",
         "subworkflow_failed",
         "workflow_relationship_created",
+        "delegation_contract_created",
+        "delegation_contract_validated",
+        "delegation_contract_rejected",
+        "delegation_budget_exceeded",
+        "delegation_capability_missing",
+        "execution_strategy_selected",
+        "execution_strategy_escalated",
+        "execution_strategy_blocked",
+        "execution_strategy_terminated",
     ]
     iteration: int
     payload: dict[str, Any] = Field(default_factory=dict)
