@@ -1,0 +1,22 @@
+{
+  "name": "calculator_application_for_policy",
+  "version": "1.0.0",
+  "generated_by": "Freya",
+  "rules": [
+    {
+      "id": "numeric_inputs",
+      "description": "All inputs must be numeric values.",
+      "type": "validation"
+    },
+    {
+      "id": "no_divide_by_zero",
+      "description": "Division by zero is not permitted.",
+      "type": "safety"
+    },
+    {
+      "id": "result_range",
+      "description": "Results must be finite real numbers.",
+      "type": "output"
+    }
+  ]
+}
